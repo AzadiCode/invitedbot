@@ -578,11 +578,12 @@ def render(page, *a):
                 f"🧠 هوش مصنوعی: {'روشن' if cfg['ai_enabled'] and AI_ON else 'خاموش'}\n"
                 f"🤖 یوزربات: {'متصل ✅' if user else 'قطع ❌ (از دکمه‌ی اتصال وارد شو)'}")
         rc = c("invites", {"status": "review"})
-        return text, [[B("👥 کاربران", "users:0"), B("🔎 جستجو", "find")],
+        return text, ([[B("👥 کاربران", "users:0"), B("🔎 جستجو", "find")],
                       [B(f"🕵️ بررسی ({rc})", "rev"), B(f"💸 پرداخت‌ها ({len(unpaid)})", "pay")],
                       [B("❌ ردشده‌ها", "rej"), B("📤 خروجی CSV", "csv")],
                       [B("⚙️ تنظیمات", "set"), B("📣 ارسال همگانی", "bc")],
-                      [B("🔑 اتصال یوزربات", "ulogin")] + ([B("🚪 قطع یوزربات", "ulogout")] if user else [])]
+                      [B("🔑 اتصال با کد", "ulogin"), B("📷 اتصال با QR", "uqr")]]
+                      + ([[B("🚪 قطع یوزربات", "ulogout")]] if user else []))
     if page == "users":
         p = int(a[0])
         total = db.users.count_documents({})
@@ -716,6 +717,10 @@ async def admin_cb(event):
         admin_state[uid] = ("login", "phone")
         return await event.edit("📱 شماره‌ی اکانت یوزربات رو با کد کشور بفرست.\nمثال: +989123456789",
                                 buttons=[[B("🔙 لغو", "home")]])
+    if act == "uqr":
+        await event.edit("📷 در حال ساخت QR ...", buttons=[[B("🔙 لغو", "home")]])
+        asyncio.create_task(qr_login_flow(event, uid))
+        return
     if act == "ulogout":
         await detach_userbot()
         db.settings.delete_one({"_id": "session"})
@@ -838,6 +843,48 @@ async def login_done(event):
     me = await c.get_me()
     await event.respond(f"✅ یوزربات وصل شد: {me.first_name or ''} @{me.username or '-'}\n"
                         "از الان به پیوی‌ها جواب می‌ده. (سشن توی دیتابیس ذخیره شد)", buttons=[[B("🔙 پنل", "home")]])
+
+
+async def send_qr(uid, url):
+    cap = ("📷 با اکانت یوزربات در یه دستگاه دیگه: تلگرام ← Settings ← Devices ← Link Desktop Device ← اسکن این QR.\n"
+           "⏱ هر ~۳۰ ثانیه QR جدید می‌فرستم؛ آخری رو اسکن کن.")
+    try:
+        import qrcode
+        buf = io.BytesIO()
+        qrcode.make(url).save(buf, format="PNG")
+        buf.seek(0)
+        buf.name = "qr.png"
+        try:
+            await bot.send_file(uid, buf, caption=cap, buttons=[[Button.url("🔗 باز کردن لینک لاگین", url)]])
+        except Exception:
+            buf.seek(0)
+            await bot.send_file(uid, buf, caption=cap + "\n\n" + url)
+    except Exception:
+        await bot_send(uid, cap + "\n\n" + url)
+
+
+async def qr_login_flow(event, uid):
+    global login_client
+    try:
+        if login_client:
+            await login_client.disconnect()
+        login_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await login_client.connect()
+        qr = await login_client.qr_login()
+        for _ in range(6):
+            await send_qr(uid, qr.url)
+            try:
+                await qr.wait(timeout=28)
+                return await login_done(event)
+            except asyncio.TimeoutError:
+                await qr.recreate()
+            except SessionPasswordNeededError:
+                admin_state[uid] = ("login", "pw")
+                return await bot_send(uid, "🔐 رمز تأیید دو مرحله‌ای اکانت رو بفرست:")
+        await bot_send(uid, "⌛ QR منقضی شد. دوباره از پنل «اتصال با QR» رو بزن.")
+    except Exception as e:
+        log.exception("qr login failed")
+        await bot_send(uid, f"❌ خطا در QR: {type(e).__name__}")
 
 
 async def login_step(event, st, raw):
