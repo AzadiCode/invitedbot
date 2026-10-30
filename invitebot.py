@@ -10,7 +10,7 @@ InviteBot — یوزربات هوشمند + بات تأیید هویت + پنل 
    کپچا ← شماره‌ی خودش (request_contact) ← امتیازدهی. فقط بعد از تأیید، پاداش حساب می‌شه.
 3) پنل ادمین: داخل همون بات، با /admin
 """
-import os, re, time, random, hashlib, secrets, asyncio, logging, threading
+import csv, io, os, re, time, random, hashlib, secrets, asyncio, logging, threading
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -252,6 +252,11 @@ async def on_dm(event):
     if u.get("banned"):
         return
     cfg = get_cfg()
+    try:
+        await event.mark_read()
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(1.5, 5.0))
     if is_keyword(text, cfg["keywords"]):
         reply = task_text(u, cfg)
         await typing_pause(event, 30)
@@ -379,6 +384,9 @@ async def on_contact(event):
     await finalize(event, uid)
 
 
+_ch_warned = False
+
+
 async def is_member(ch, uid):
     try:
         p = await bot.get_permissions(ch, uid)
@@ -387,7 +395,11 @@ async def is_member(ch, uid):
         if "participant" in type(e).__name__.lower() or "participant" in str(e).lower():
             return False
         log.warning("membership check failed (بات باید ادمین کانال باشه): %s", e)
-        return True
+        global _ch_warned
+        if not _ch_warned:
+            _ch_warned = True
+            await notify_admins("⚠️ چک عضویت کانال خطا داد؛ مطمئن شو بات ادمین کانال اجباریه. تا اون موقع تأییدها متوقف می‌مونن.")
+        return False
 
 
 def id_points(uid):
@@ -431,10 +443,13 @@ async def finalize(event, uid):
         return await reject_invite(uid, hard, score, why)
     recent = db.invites.count_documents({"inviter": inv["inviter"], "status": "verified",
                                          "verified_at": {"$gte": now() - timedelta(minutes=cfg["velocity_minutes"])}})
-    if score >= cfg["min_score"] and recent < cfg["velocity_max"]:
+    mutual = bool(db.invites.find_one({"_id": inv["inviter"], "inviter": uid}))
+    if mutual:
+        why.append("mutual-invite")
+    if score >= cfg["min_score"] and recent < cfg["velocity_max"] and not mutual:
         await verify_invite(uid, score, why)
     elif score >= cfg["review_score"]:
-        if score >= cfg["min_score"]:
+        if score >= cfg["min_score"] and recent >= cfg["velocity_max"]:
             why.append("velocity:fast-invites")
         db.invites.update_one({"_id": uid}, {"$set": {"status": "review", "score": score, "reasons": why}})
         await event.respond("⏳ اطلاعاتت ثبت شد و برای بررسی نهایی به تیم رفت. نتیجه همین‌جا اعلام می‌شه.")
@@ -482,7 +497,8 @@ async def verify_invite(uid, score=None, why=None, by="auto"):
     upd = {"status": "verified", "verified_at": now(), "by": by}
     if score is not None:
         upd.update(score=score, reasons=why or [])
-    if not db.invites.update_one({"_id": uid, "status": {"$in": ["pending", "review"]}}, {"$set": upd}).modified_count:
+    ok_states = ["pending", "review"] + (["rejected"] if by.startswith("admin") else [])
+    if not db.invites.update_one({"_id": uid, "status": {"$in": ok_states}}, {"$set": upd}).modified_count:
         return
     inv = db.invites.find_one({"_id": uid})
     await bot_send(uid, "✅ هویتت تأیید شد. ممنون! 🙏", reply_markup={"remove_keyboard": True})
@@ -560,6 +576,7 @@ def render(page, *a):
         rc = c("invites", {"status": "review"})
         return text, [[B("👥 کاربران", "users:0"), B("🔎 جستجو", "find")],
                       [B(f"🕵️ بررسی ({rc})", "rev"), B(f"💸 پرداخت‌ها ({len(unpaid)})", "pay")],
+                      [B("❌ ردشده‌ها", "rej"), B("📤 خروجی CSV", "csv")],
                       [B("⚙️ تنظیمات", "set"), B("📣 ارسال همگانی", "bc")]]
     if page == "users":
         p = int(a[0])
@@ -594,6 +611,15 @@ def render(page, *a):
                 f"📊 امتیاز: {inv.get('score')}\n🧾 {', '.join(inv.get('reasons', []))}\n"
                 f"👥 دعوت‌کننده: {ir.get('name', '')} @{ir.get('username') or '-'} — {inv['inviter']}")
         return text, [[B("✅ تأیید", f"ra:{inv['_id']}"), B("❌ رد", f"rr:{inv['_id']}")], [B("🔙", "home")]]
+    if page == "rej":
+        invs = list(db.invites.find({"status": "rejected"}).sort("at", -1).limit(8))
+        if not invs:
+            return "❌ ردشده‌ای نیست.", [[B("🔙", "home")]]
+        text = "❌ آخرین ردشده‌ها:\n\n" + "\n".join(
+            f"• {i.get('name', '')} @{i.get('username') or '-'} — {i['_id']} — {REASONS.get(i.get('reason'), i.get('reason'))} ({i.get('score', '-')})"
+            for i in invs)
+        rows = [[B(f"✅ تأیید دستی: {i.get('name', '')[:12]}", f"ra:{i['_id']}")] for i in invs]
+        return text, rows + [[B("🔙", "home")]]
     if page == "pay":
         us = list(db.users.find({"status": "completed", "paid": {"$ne": True}}).limit(10))
         if not us:
@@ -670,6 +696,17 @@ async def admin_cb(event):
     if act == "reset":
         db.users.update_one({"_id": int(a[1])}, {"$set": {"verified": 0, "earned": 0, "status": "active", "paid": False}})
         return await show(event, "u", a[1])
+    if act == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id", "name", "username", "status", "verified", "earned_usd", "paid"])
+        for u in db.users.find({}):
+            w.writerow([u["_id"], u.get("name", ""), u.get("username") or "", u["status"], u.get("verified", 0),
+                        f"{u.get('earned', 0) / 100:.2f}", bool(u.get("paid"))])
+        data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+        data.name = "users.csv"
+        await bot.send_file(uid, data, caption="📤 خروجی کاربران")
+        return
     if act == "tog":
         set_cfg("ai_enabled", not cfg["ai_enabled"]); return await show(event, "set")
     if act == "edit" and a[1] in LABELS:
@@ -691,7 +728,7 @@ async def admin_cb(event):
             return await event.edit("🚀 ارسال شروع شد؛ پایانش گزارش می‌دم.", buttons=[[B("🔙", "home")]])
         return await show(event, "home")
     admin_state.pop(uid, None)
-    await show(event, act if act in ("home", "users", "u", "rev", "pay", "set") else "home", *a[1:])
+    await show(event, act if act in ("home", "users", "u", "rev", "pay", "set", "rej") else "home", *a[1:])
 
 
 async def admin_text(event):

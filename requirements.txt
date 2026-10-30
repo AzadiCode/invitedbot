@@ -1,0 +1,5 @@
+telethon
+pymongo
+mongomock
+flask
+requests
