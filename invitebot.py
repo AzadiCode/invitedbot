@@ -20,12 +20,13 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from telethon import TelegramClient, events, Button, types
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import (FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError,
+                             PhoneCodeExpiredError, PhoneNumberInvalidError, PasswordHashInvalidError)
 
 # ───────────────────────── تنظیمات (Environment) ─────────────────────────
 API_ID         = int(os.environ["API_ID"])
 API_HASH       = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]            # خروجی gen_session.py (اکانت یوزربات)
+SESSION_STRING = os.environ.get("SESSION_STRING", "")   # اختیاری؛ خالی = لاگین از پنل ادمین
 BOT_TOKEN      = os.environ["BOT_TOKEN"]                 # بات تأیید + پنل ادمین
 ADMIN_IDS      = {int(x) for x in re.split(r"[,\s]+", os.environ["ADMIN_IDS"].strip()) if x}
 MONGO_URI      = os.environ.get("MONGO_URI", "").strip()  # خالی = حافظه‌ی موقت
@@ -136,6 +137,8 @@ async def notify_admins(text):
 
 async def send_to_user(uid, text):
     """پیام از یوزربات به یه کاربر (با access_hash ذخیره‌شده)"""
+    if user is None:
+        return False
     u = db.users.find_one({"_id": uid}) or {}
     peer = types.InputPeerUser(uid, u["ah"]) if u.get("ah") is not None else uid
     for _ in range(2):
@@ -572,12 +575,14 @@ def render(page, *a):
                 f"📨 دعوت‌ها: تأییدشده {c('invites', {'status': 'verified'})} | در انتظار {c('invites', {'status': 'pending'})} | "
                 f"بررسی {c('invites', {'status': 'review'})} | ردشده {c('invites', {'status': 'rejected'})}\n"
                 f"💸 پرداخت‌نشده: {len(unpaid)} نفر — {money(sum(u.get('earned', 0) for u in unpaid))}\n"
-                f"🧠 هوش مصنوعی: {'روشن' if cfg['ai_enabled'] and AI_ON else 'خاموش'}")
+                f"🧠 هوش مصنوعی: {'روشن' if cfg['ai_enabled'] and AI_ON else 'خاموش'}\n"
+                f"🤖 یوزربات: {'متصل ✅' if user else 'قطع ❌ (از دکمه‌ی اتصال وارد شو)'}")
         rc = c("invites", {"status": "review"})
         return text, [[B("👥 کاربران", "users:0"), B("🔎 جستجو", "find")],
                       [B(f"🕵️ بررسی ({rc})", "rev"), B(f"💸 پرداخت‌ها ({len(unpaid)})", "pay")],
                       [B("❌ ردشده‌ها", "rej"), B("📤 خروجی CSV", "csv")],
-                      [B("⚙️ تنظیمات", "set"), B("📣 ارسال همگانی", "bc")]]
+                      [B("⚙️ تنظیمات", "set"), B("📣 ارسال همگانی", "bc")],
+                      [B("🔑 اتصال یوزربات", "ulogin")] + ([B("🚪 قطع یوزربات", "ulogout")] if user else [])]
     if page == "users":
         p = int(a[0])
         total = db.users.count_documents({})
@@ -707,6 +712,14 @@ async def admin_cb(event):
         data.name = "users.csv"
         await bot.send_file(uid, data, caption="📤 خروجی کاربران")
         return
+    if act == "ulogin":
+        admin_state[uid] = ("login", "phone")
+        return await event.edit("📱 شماره‌ی اکانت یوزربات رو با کد کشور بفرست.\nمثال: +989123456789",
+                                buttons=[[B("🔙 لغو", "home")]])
+    if act == "ulogout":
+        await detach_userbot()
+        db.settings.delete_one({"_id": "session"})
+        return await show(event, "home")
     if act == "tog":
         set_cfg("ai_enabled", not cfg["ai_enabled"]); return await show(event, "set")
     if act == "edit" and a[1] in LABELS:
@@ -737,6 +750,8 @@ async def admin_text(event):
     if not st:
         return
     raw = event.raw_text
+    if st[0] == "login":
+        return await login_step(event, st, raw)
     if st[0] == "edit":
         try:
             set_cfg(st[1], parse_setting(st[1], raw))
@@ -767,6 +782,115 @@ async def run_broadcast(admin, text):
     await bot_send(admin, f"📣 ارسال تموم شد. موفق: {ok} | ناموفق: {fail}")
 
 
+# ───────────────────────── لاگین یوزربات از داخل پنل (بدون SESSION_STRING) ─────────────────────────
+login_client = None
+login_data = {}
+
+
+async def _userbot_runner(client):
+    try:
+        await client.run_until_disconnected()
+    except Exception:
+        log.exception("userbot stopped")
+
+
+async def attach_userbot(client):
+    global user
+    user = client
+    user.add_event_handler(on_dm, events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    asyncio.create_task(_userbot_runner(client))
+
+
+async def detach_userbot():
+    global user
+    old, user = user, None
+    if old:
+        try:
+            await old.disconnect()
+        except Exception:
+            pass
+
+
+async def start_saved_userbot():
+    sess = SESSION_STRING or (db.settings.find_one({"_id": "session"}) or {}).get("s", "")
+    if not sess:
+        return False
+    c = TelegramClient(StringSession(sess), API_ID, API_HASH)
+    try:
+        await c.connect()
+        if not await c.is_user_authorized():
+            await c.disconnect()
+            return False
+        await c.get_me()
+    except Exception:
+        log.exception("userbot connect failed")
+        return False
+    await attach_userbot(c)
+    return True
+
+
+async def login_done(event):
+    global login_client
+    c, login_client = login_client, None
+    db.settings.update_one({"_id": "session"}, {"$set": {"s": c.session.save(), "at": now()}}, upsert=True)
+    await detach_userbot()
+    await attach_userbot(c)
+    me = await c.get_me()
+    await event.respond(f"✅ یوزربات وصل شد: {me.first_name or ''} @{me.username or '-'}\n"
+                        "از الان به پیوی‌ها جواب می‌ده. (سشن توی دیتابیس ذخیره شد)", buttons=[[B("🔙 پنل", "home")]])
+
+
+async def login_step(event, st, raw):
+    global login_client
+    uid, step = event.sender_id, st[1]
+    cancel = [[B("🔙 لغو", "home")]]
+    try:
+        if step == "phone":
+            phone = "+" + re.sub(r"\D", "", raw)
+            if login_client:
+                await login_client.disconnect()
+            login_client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await login_client.connect()
+            sent = await login_client.send_code_request(phone)
+            login_data[uid] = {"phone": phone, "hash": sent.phone_code_hash}
+            admin_state[uid] = ("login", "code")
+            return await event.respond(
+                "📨 کد به تلگرام اکانت یوزربات اومد.\n⚠️ ارقام رو با خط تیره یا فاصله بفرست (مثلاً 1-2-3-4-5)؛ "
+                "اگه کد رو سرراست بفرستی تلگرام باطلش می‌کنه.", buttons=cancel)
+        if step == "code":
+            d = login_data.get(uid) or {}
+            try:
+                await login_client.sign_in(d["phone"], re.sub(r"\D", "", raw), phone_code_hash=d["hash"])
+            except SessionPasswordNeededError:
+                admin_state[uid] = ("login", "pw")
+                return await event.respond("🔐 رمز تأیید دو مرحله‌ای اکانت رو بفرست:", buttons=cancel)
+            return await login_done(event)
+        if step == "pw":
+            await login_client.sign_in(password=raw)
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return await login_done(event)
+    except PhoneCodeInvalidError:
+        admin_state[uid] = ("login", "code")
+        return await event.respond("❌ کد اشتباهه. دوباره بفرست (با خط تیره):", buttons=cancel)
+    except PhoneCodeExpiredError:
+        admin_state[uid] = ("login", "phone")
+        return await event.respond("⌛ کد منقضی شد. دوباره شماره رو بفرست تا کد جدید بیاد:", buttons=cancel)
+    except PhoneNumberInvalidError:
+        admin_state[uid] = ("login", "phone")
+        return await event.respond("❌ شماره نامعتبره. مثل +989123456789 بفرست:", buttons=cancel)
+    except PasswordHashInvalidError:
+        admin_state[uid] = ("login", "pw")
+        return await event.respond("❌ رمز اشتباهه. دوباره بفرست:", buttons=cancel)
+    except FloodWaitError as e:
+        return await event.respond(f"⏳ تلگرام محدود کرده؛ {e.seconds} ثانیه بعد دوباره از پنل شروع کن.", buttons=cancel)
+    except Exception as e:
+        log.exception("login failed")
+        return await event.respond(f"❌ خطا: {type(e).__name__}\nاز پنل دوباره شروع کن.", buttons=cancel)
+
+
 # ───────────────────────── اجرا ─────────────────────────
 web = Flask(__name__)
 
@@ -780,13 +904,10 @@ async def main():
     global user, bot, BOT_USERNAME
     threading.Thread(target=lambda: web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))),
                      daemon=True).start()
-    user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     bot = TelegramClient(StringSession(), API_ID, API_HASH)
-    await user.start()
     await bot.start(bot_token=BOT_TOKEN)
     BOT_USERNAME = (await bot.get_me()).username
 
-    user.add_event_handler(on_dm, events.NewMessage(incoming=True, func=lambda e: e.is_private))
     priv = lambda e: e.is_private
     adm = lambda e: e.is_private and e.sender_id in ADMIN_IDS
     bot.add_event_handler(on_start, events.NewMessage(pattern=r"^/start(?:\s+(\S+))?$", func=priv))
@@ -801,7 +922,12 @@ async def main():
         func=lambda e: e.is_private and e.sender_id not in ADMIN_IDS and e.message.contact is None
         and not (e.raw_text or "").startswith("/")))
     log.info("آماده — بات تأیید: @%s | ادمین‌ها: %s", BOT_USERNAME, ADMIN_IDS)
-    await asyncio.gather(user.run_until_disconnected(), bot.run_until_disconnected())
+    if await start_saved_userbot():
+        log.info("یوزربات وصل شد")
+    else:
+        log.warning("یوزربات وصل نیست؛ از /admin ← اتصال یوزربات وارد شو")
+        await notify_admins("🔑 یوزربات هنوز وصل نیست. بات تأیید رو باز کن: /admin ← 🔑 اتصال یوزربات")
+    await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
