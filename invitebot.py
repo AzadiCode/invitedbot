@@ -7,7 +7,7 @@ InviteBot — یوزربات هوشمند + بات تأیید هویت + پنل 
 1) یوزربات (اکانت شخصی خودت، Telethon): به پیوی‌ها هوشمند جواب می‌ده. وقتی کسی «کلمه‌ی ثبت‌نام» بفرسته،
    تسک «دعوت N نفر» + لینک اختصاصی می‌گیره. با هر دعوتِ تأییدشده بهش خبر می‌ده و آخر تبریک می‌گه.
 2) بات تأیید (Bot Token): لینک دعوت رو باز می‌کنه و فرد دعوت‌شده رو تأیید می‌کنه:
-   کپچا ← شماره‌ی خودش (request_contact) ← امتیازدهی. فقط بعد از تأیید، پاداش حساب می‌شه.
+   کپچا ← شماره‌ی خودش (request_contact) ← بررسی دستگاه (مینی‌اپ) ← تحلیل الگوهای چندحسابی ← امتیازدهی. فقط بعد از تأیید، پاداش حساب می‌شه.
 3) پنل ادمین: داخل همون بات، با /admin
 """
 import csv, io, os, re, time, random, hashlib, secrets, asyncio, logging, threading
@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
 import requests
-from flask import Flask
+from flask import Flask, request, jsonify, Response
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from telethon import TelegramClient, events, Button, types
@@ -35,6 +35,7 @@ AI_BASE_URL    = re.sub(r"/chat/completions/?$", "", os.environ.get("AI_BASE_URL
 AI_API_KEY     = os.environ.get("AI_API_KEY", "")
 AI_MODEL       = os.environ.get("AI_MODEL", "")
 AI_ON          = bool(AI_BASE_URL and AI_API_KEY and AI_MODEL)
+PUBLIC_URL     = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")  # آدرس https سرویس؛ برای بررسی دستگاه
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("invitebot")
@@ -47,6 +48,9 @@ else:
     log.warning("MONGO_URI تنظیم نشده؛ با هر ری‌استارت همه‌چی پاک می‌شه")
 db.users.create_index("code", unique=True)
 db.invites.create_index([("inviter", 1), ("status", 1)])
+db.devices.create_index("did")
+db.devices.create_index("fp")
+db.devices.create_index("ip")
 
 user = bot = None          # کلاینت‌ها داخل main ساخته می‌شن
 BOT_USERNAME = ""
@@ -62,6 +66,9 @@ DEFAULTS = {
     "required_channel": os.environ.get("REQUIRED_CHANNEL", "").lstrip("@"),
     "velocity_max": 2,                        # اگه یه نفر در velocity_minutes دقیقه بیشتر از این تأیید بگیره → بررسی دستی
     "velocity_minutes": 15,
+    "young_id": 7_500_000_000,                # آیدی بزرگ‌تر از این = حساب تازه‌ساز (تقریبی؛ از پنل تنظیم کن)
+    "id_gap": 1_500_000,                      # دو دعوت‌شده‌ی یک دعوت‌کننده با آیدی نزدیک‌تر از این = ساخته‌شده‌ی هم‌زمان
+    "max_flags": 3,                           # تعداد نشانه‌ی مشکوک برای رد خودکار
     "ai_enabled": True,
     "business_prompt": ("تو دستیار یه کسب‌وکار آنلاین هستی که در پیوی تلگرام جواب می‌ده. "
                         "[اینجا توضیح کسب‌وکارت، خدمات، لحن و قوانین رو بنویس — از پنل ادمین ویرایشش کن]"),
@@ -276,7 +283,9 @@ async def on_dm(event):
 EMOJIS = ["🍎", "🚗", "🐱", "⭐", "🌹", "🎈", "🔔", "🍕"]
 REASONS = {"flagged": "حساب توسط تلگرام مشکوک/اسکم علامت خورده", "prefix": "کشور شماره مجاز نیست",
            "dup_phone": "این شماره قبلاً برای حساب دیگه‌ای استفاده شده", "captcha": "کپچا ناموفق بود",
-           "score": "امتیاز اعتماد حساب کافی نبود", "admin": "توسط تیم رد شد"}
+           "score": "امتیاز اعتماد حساب کافی نبود", "admin": "توسط تیم رد شد",
+           "phone_fmt": "فرمت شماره معتبر نیست", "dup_device": "این دستگاه قبلاً برای حساب دیگه‌ای استفاده شده",
+           "risk": "الگوی مشکوک (چند حساب از یک منبع)"}
 
 
 async def send_captcha(event, uid):
@@ -301,6 +310,8 @@ async def resume(event, inv):
         await send_captcha(event, inv["_id"])
     elif inv.get("step") == "phone":
         await ask_phone(event)
+    elif inv.get("step") == "device":
+        await ask_device(inv["_id"])
     else:
         await finalize(event, inv["_id"])
 
@@ -362,6 +373,17 @@ async def on_captcha(event):
     await send_captcha(event, uid)
 
 
+def phone_ok(phone):
+    """ایران: فقط موبایل (989xxxxxxxxx)؛ بقیه‌ی کشورها: طول معقول"""
+    if phone.startswith("98"):
+        return bool(re.fullmatch(r"989\d{9}", phone))
+    return 8 <= len(phone) <= 15
+
+
+def _h(prefix, val):
+    return hashlib.sha256((SECRET_KEY + prefix + val).encode()).hexdigest()
+
+
 async def on_contact(event):
     uid = event.sender_id
     inv = db.invites.find_one({"_id": uid})
@@ -376,14 +398,39 @@ async def on_contact(event):
         return await reject_invite(uid, "prefix")
     if any(phone.startswith(p) for p in cfg["blocked_prefixes"]):
         return await reject_invite(uid, "prefix")
+    if not phone_ok(phone):
+        return await reject_invite(uid, "phone_fmt")
     ph = hashlib.sha256((SECRET_KEY + phone).encode()).hexdigest()
     try:
         db.phones.insert_one({"_id": ph, "uid": uid, "t": now()})
     except DuplicateKeyError:
         if (db.phones.find_one({"_id": ph}) or {}).get("uid") != uid:
             return await reject_invite(uid, "dup_phone")
-    db.invites.update_one({"_id": uid}, {"$set": {"step": "channel", "phone_hash": ph[:12]}})
+    nxt = "device" if PUBLIC_URL else "channel"
+    # phone_block: همه‌ی ارقام به‌جز ۳ رقم آخر (سیم‌کارت‌های پشت‌سرهم یک بسته)
+    db.invites.update_one({"_id": uid}, {"$set": {"step": nxt, "phone_hash": ph[:12],
+                                                  "phone_block": _h("pb", phone[:-3])[:12]}})
     await event.respond("✅ شماره تأیید شد.", buttons=Button.clear())
+    if nxt == "device":
+        return await ask_device(uid)
+    await finalize(event, uid)
+
+
+async def ask_device(uid):
+    tok = secrets.token_urlsafe(16)
+    db.invites.update_one({"_id": uid}, {"$set": {"step": "device", "dtoken": tok, "dtoken_at": time.time()}})
+    await bot_send(uid, "🔐 آخرین مرحله: بررسی امنیتی دستگاه. دکمه‌ی زیر رو بزن و صبر کن تا «انجام شد» ببینی.",
+                   reply_markup={"inline_keyboard": [[{"text": "🔐 شروع بررسی", "web_app": {"url": f"{PUBLIC_URL}/verify?t={tok}"}}]]})
+
+
+async def on_dev(event):
+    uid = event.sender_id
+    inv = db.invites.find_one({"_id": uid})
+    if not inv or inv["status"] != "pending":
+        return await event.answer("این مرحله منقضی شده.")
+    if inv.get("step") != "channel":
+        return await event.answer("اول بررسی دستگاه رو کامل کن.", alert=True)
+    await event.answer()
     await finalize(event, uid)
 
 
@@ -431,9 +478,67 @@ def score_user(u):
     return s, why, None
 
 
+LIVE = ["verified", "review", "pending"]
+
+
+def risk_flags(uid, inv, cfg):
+    """تشخیص الگوی چندحسابی. خروجی: (لیست نشانه‌ها, دلیل رد قطعی یا None)"""
+    flags, inviter = [], inv["inviter"]
+    sib = {"inviter": inviter, "_id": {"$ne": uid}, "status": {"$in": LIVE}}
+    sibs = list(db.invites.find(sib))
+    sib_ids = [x["_id"] for x in sibs]
+    if uid >= cfg["young_id"]:
+        flags.append("young-account")
+    recent = db.invites.count_documents({"inviter": inviter, "status": "verified",
+                                         "verified_at": {"$gte": now() - timedelta(minutes=cfg["velocity_minutes"])}})
+    if recent >= cfg["velocity_max"]:
+        flags.append("velocity")
+    if db.invites.find_one({"_id": inviter, "inviter": uid}):
+        flags.append("mutual-invite")
+    # شماره‌های هم‌بسته (سیم‌کارت‌های خریداری‌شده‌ی پشت‌سرهم)
+    pb = inv.get("phone_block")
+    if pb:
+        if any(x.get("phone_block") == pb for x in sibs):
+            flags.append("phone-block")
+        inviter_inv = db.invites.find_one({"_id": inviter}) or {}
+        if inviter_inv.get("phone_block") == pb:
+            flags.append("phone-block-inviter")
+    # حساب‌هایی که هم‌زمان ساخته شدن (آیدی عددی نزدیک)
+    gap = cfg["id_gap"]
+    if gap > 0 and uid >= 6_000_000_000:
+        if any(i >= 6_000_000_000 and abs(i - uid) <= gap for i in sib_ids):
+            flags.append("id-cluster")
+        if inviter >= 6_000_000_000 and abs(inviter - uid) <= gap:
+            flags.append("id-near-inviter")
+    # دستگاه / IP
+    dev = db.devices.find_one({"_id": uid})
+    if dev:
+        others = [d["_id"] for d in db.devices.find({"did": dev["did"], "_id": {"$ne": uid}})]
+        if others and db.invites.count_documents({"_id": {"$in": others}, "status": {"$in": ["verified", "review"]}}):
+            return flags, "dup_device"
+        if db.devices.find_one({"_id": inviter, "did": dev["did"]}):
+            return flags, "dup_device"
+        if sib_ids and db.devices.find_one({"_id": {"$in": sib_ids}, "fp": dev["fp"]}):
+            flags.append("same-fingerprint")
+        if sib_ids and db.devices.find_one({"_id": {"$in": sib_ids}, "ip": dev["ip"]}):
+            flags.append("same-ip")
+        if db.devices.find_one({"_id": inviter, "$or": [{"fp": dev["fp"]}, {"ip": dev["ip"]}]}):
+            flags.append("same-source-as-inviter")
+    return flags, None
+
+
+def risk_of(inviter_id):
+    bad = tot = 0
+    for i in db.invites.find({"inviter": inviter_id, "status": {"$in": ["verified", "review"]}}):
+        tot += 1
+        if [f for f in i.get("flags", []) if f != "young-account"]:
+            bad += 1
+    return bad, tot
+
+
 async def finalize(event, uid):
     inv = db.invites.find_one({"_id": uid})
-    if not inv or inv["status"] != "pending":
+    if not inv or inv["status"] != "pending" or inv.get("step") != "channel":
         return
     cfg = get_cfg()
     ch = cfg["required_channel"]
@@ -444,16 +549,17 @@ async def finalize(event, uid):
     score, why, hard = score_user(sender)
     if hard:
         return await reject_invite(uid, hard, score, why)
-    recent = db.invites.count_documents({"inviter": inv["inviter"], "status": "verified",
-                                         "verified_at": {"$gte": now() - timedelta(minutes=cfg["velocity_minutes"])}})
-    mutual = bool(db.invites.find_one({"_id": inv["inviter"], "inviter": uid}))
-    if mutual:
-        why.append("mutual-invite")
-    if score >= cfg["min_score"] and recent < cfg["velocity_max"] and not mutual:
+    flags, hard = risk_flags(uid, inv, cfg)
+    why = why + flags
+    db.invites.update_one({"_id": uid}, {"$set": {"flags": flags}})
+    if hard:
+        return await reject_invite(uid, hard, score, why)
+    blocking = [f for f in flags if f != "young-account"]
+    if len(flags) >= cfg["max_flags"]:
+        await reject_invite(uid, "risk", score, why)
+    elif score >= cfg["min_score"] and not blocking:
         await verify_invite(uid, score, why)
     elif score >= cfg["review_score"]:
-        if score >= cfg["min_score"] and recent >= cfg["velocity_max"]:
-            why.append("velocity:fast-invites")
         db.invites.update_one({"_id": uid}, {"$set": {"status": "review", "score": score, "reasons": why}})
         await event.respond("⏳ اطلاعاتت ثبت شد و برای بررسی نهایی به تیم رفت. نتیجه همین‌جا اعلام می‌شه.")
         await notify_admins("🕵️ یک دعوت برای بررسی دستی در صفه. /admin")
@@ -534,6 +640,7 @@ LABELS = {
     "keywords": "🔑 کلمات ثبت‌نام", "rewards": "💰 پاداش دعوت‌ها", "min_score": "✅ حداقل امتیاز تأیید",
     "review_score": "🕵️ حداقل امتیاز بررسی", "allowed_prefixes": "🌍 پیش‌شماره‌ی مجاز",
     "blocked_prefixes": "⛔ پیش‌شماره‌ی ممنوع", "required_channel": "📢 کانال اجباری",
+    "young_id": "🆕 آیدی حساب تازه", "id_gap": "🆔 فاصله‌ی آیدی مشکوک", "max_flags": "🚩 سقف نشانه‌ی مشکوک",
     "velocity_max": "⚡ سقف دعوت سریع", "velocity_minutes": "⏱ بازه‌ی دعوت سریع (دقیقه)",
     "business_prompt": "🧠 توضیح کسب‌وکار (AI)", "msg_task": "✉️ پیام تسک", "msg_progress": "✉️ پیام پیشرفت",
     "msg_done": "🎊 پیام تبریک", "msg_already": "✉️ پیام تکمیل‌شده",
@@ -546,6 +653,9 @@ HELP = {
     "blocked_prefixes": "مثال: 888, 1 . برای خالی کردن بفرست -",
     "required_channel": "یوزرنیم کانال (بات باید ادمینش باشه). برای حذف بفرست -",
     "velocity_max": "عدد", "velocity_minutes": "عدد",
+    "young_id": "آیدی عددی؛ حساب‌های با آیدی بزرگ‌تر «تازه» حساب می‌شن (تقریبی). مثال: 7500000000",
+    "id_gap": "اگه آیدی دو دعوت‌شده‌ی یک نفر کمتر از این فاصله داشته باشه یعنی هم‌زمان ساخته شدن. 0 = خاموش",
+    "max_flags": "اگه تعداد نشانه‌های مشکوک یه دعوت به این عدد برسه خودکار رد می‌شه (پیشنهاد: 3)",
     "business_prompt": "توضیح کسب‌وکار و لحن پاسخ هوش مصنوعی",
 }
 PLACEHOLDERS = "\nجاگذاری‌ها: {link} {need} {done} {reward} {earned} {total} {rewards_list}"
@@ -600,11 +710,13 @@ def render(page, *a):
         if not u:
             return "کاربر پیدا نشد.", [[B("🔙", "home")]]
         invs = list(db.invites.find({"inviter": u["_id"]}).limit(10))
-        il = "\n".join(f"  • {i['_id']} {i.get('name', '')} — {i['status']} ({i.get('score', '-')})" for i in invs) or "  —"
+        il = "\n".join(f"  • {i['_id']} {i.get('name', '')} — {i['status']} ({i.get('score', '-')})"
+                       f"{' 🚩' if [f for f in i.get('flags', []) if f != 'young-account'] else ''}" for i in invs) or "  —"
+        bad, tot = risk_of(u["_id"])
         text = (f"👤 {u.get('name', '')} @{u.get('username') or '-'}\n🆔 {u['_id']}\n"
                 f"وضعیت: {u['status']}{' ⛔بن' if u.get('banned') else ''}\n"
                 f"پیشرفت: {u.get('verified', 0)}/{need} | درآمد: {money(u.get('earned', 0))}"
-                f"{' | پرداخت‌شده ✅' if u.get('paid') else ''}\n\nدعوت‌ها:\n{il}")
+                f"{' | پرداخت‌شده ✅' if u.get('paid') else ''}\n🚩 دعوت‌های مشکوک: {bad}/{tot}\n\nدعوت‌ها:\n{il}")
         ban = B("✅ آنبن", f"unban:{u['_id']}") if u.get("banned") else B("⛔ بن", f"ban:{u['_id']}")
         return text, [[ban, B("♻️ ریست پیشرفت", f"reset:{u['_id']}")], [B("🔙", "users:0")]]
     if page == "rev":
@@ -613,9 +725,11 @@ def render(page, *a):
         if not inv:
             return "🕵️ صف بررسی خالیه. ✅", [[B("🔙", "home")]]
         ir = db.users.find_one({"_id": inv["inviter"]}) or {}
+        bad, tot = risk_of(inv["inviter"])
         text = (f"🕵️ بررسی ({left} مورد)\n\n👤 دعوت‌شده: {inv.get('name', '')} @{inv.get('username') or '-'} — {inv['_id']}\n"
                 f"📊 امتیاز: {inv.get('score')}\n🧾 {', '.join(inv.get('reasons', []))}\n"
-                f"👥 دعوت‌کننده: {ir.get('name', '')} @{ir.get('username') or '-'} — {inv['inviter']}")
+                f"👥 دعوت‌کننده: {ir.get('name', '')} @{ir.get('username') or '-'} — {inv['inviter']}\n"
+                f"🚩 سابقه‌ی مشکوک دعوت‌کننده: {bad}/{tot}")
         return text, [[B("✅ تأیید", f"ra:{inv['_id']}"), B("❌ رد", f"rr:{inv['_id']}")], [B("🔙", "home")]]
     if page == "rej":
         invs = list(db.invites.find({"status": "rejected"}).sort("at", -1).limit(8))
@@ -631,7 +745,8 @@ def render(page, *a):
         if not us:
             return "💸 پرداخت‌نشده‌ای نیست. ✅", [[B("🔙", "home")]]
         text = "💸 تکمیل‌شده‌های پرداخت‌نشده:\n\n" + "\n".join(
-            f"• {u.get('name', '')} @{u.get('username') or '-'} — {u['_id']} — {money(u.get('earned', 0))}" for u in us)
+            f"• {u.get('name', '')} @{u.get('username') or '-'} — {u['_id']} — {money(u.get('earned', 0))}"
+            + (lambda r: f" ⚠️ مشکوک {r[0]}/{r[1]}" if r[0] else "")(risk_of(u["_id"])) for u in us)
         rows = [[B(f"✅ پرداخت شد: {u.get('name', '')[:12]} {money(u.get('earned', 0))}", f"pd:{u['_id']}")] for u in us]
         return text, rows + [[B("🔙", "home")]]
     if page == "set":
@@ -656,7 +771,7 @@ def parse_setting(key, raw):
             raise ValueError("فقط عدد (مثلاً 1, 1, 1.2)")
         if not (1 <= len(v) <= 10) or any(c <= 0 for c in v): raise ValueError("بین ۱ تا ۱۰ عدد مثبت")
         return v
-    if key in ("min_score", "review_score", "velocity_max", "velocity_minutes"):
+    if key in ("min_score", "review_score", "velocity_max", "velocity_minutes", "young_id", "id_gap", "max_flags"):
         if not raw.isdigit(): raise ValueError("باید عدد باشه")
         return int(raw)
     if key in ("allowed_prefixes", "blocked_prefixes"):
@@ -947,6 +1062,70 @@ def health():
     return "ok"
 
 
+VERIFY_HTML = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>body{font-family:system-ui,Tahoma;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#111);
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
+#m{font-size:18px;padding:24px;line-height:2}</style></head><body><div id="m">⏳ در حال بررسی امنیتی دستگاه ...</div>
+<script>
+(async()=>{
+const tg=window.Telegram&&Telegram.WebApp;if(tg){tg.ready();tg.expand();}
+const out=t=>document.getElementById('m').textContent=t;
+try{
+const q=new URLSearchParams(location.search).get('t')||'';
+const rnd=()=>Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');
+let did=null;try{did=localStorage.getItem('did')}catch(e){}
+if(!did){const m=document.cookie.match(/(?:^|; )did=([a-f0-9]{32})/);if(m)did=m[1];}
+if(!did)did=rnd();
+try{localStorage.setItem('did',did)}catch(e){}
+document.cookie='did='+did+'; max-age=315360000; path=/; SameSite=None; Secure';
+let c='';try{const cv=document.createElement('canvas');cv.width=240;cv.height=60;const x=cv.getContext('2d');
+x.textBaseline='top';x.font='16px Arial';x.fillStyle='#f60';x.fillRect(10,5,100,30);x.fillStyle='#069';
+x.fillText('Fp check 1.2',12,8);c=cv.toDataURL();}catch(e){}
+let g='';try{const gl=document.createElement('canvas').getContext('webgl');const e=gl.getExtension('WEBGL_debug_renderer_info');
+g=gl.getParameter(e.UNMASKED_RENDERER_WEBGL)+'|'+gl.getParameter(e.UNMASKED_VENDOR_WEBGL);}catch(e){}
+const raw=[c,g,screen.width,screen.height,devicePixelRatio,Intl.DateTimeFormat().resolvedOptions().timeZone,
+(navigator.languages||[]).join(','),navigator.hardwareConcurrency,navigator.deviceMemory,navigator.platform].join('||');
+const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(raw));
+const fp=Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+const r=await fetch('/verify/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({t:q,did:did,fp:fp})});
+const j=await r.json();
+if(j.ok){out('✅ انجام شد! به بات برگرد و دکمه‌ی «ادامه» رو بزن.');setTimeout(()=>{if(tg)tg.close()},1200);}
+else out('❌ بررسی ناموفق بود یا لینک منقضی شده. به بات برگرد و دوباره شروع کن.');
+}catch(e){out('❌ خطا در بررسی. دوباره تلاش کن.');}
+})();
+</script></body></html>"""
+
+
+@web.get("/verify")
+def verify_page():
+    return Response(VERIFY_HTML, mimetype="text/html")
+
+
+@web.post("/verify/api")
+def verify_api():
+    d = request.get_json(silent=True) or {}
+    t, did, fp = str(d.get("t", ""))[:64], str(d.get("did", "")), str(d.get("fp", ""))
+    if not (re.fullmatch(r"[A-Za-z0-9_-]{16,64}", t) and re.fullmatch(r"[a-f0-9]{32}", did)
+            and re.fullmatch(r"[a-f0-9]{64}", fp)):
+        return jsonify(ok=False), 400
+    inv = db.invites.find_one({"dtoken": t, "step": "device", "status": "pending"})
+    if not inv or time.time() - inv.get("dtoken_at", 0) > 900:
+        return jsonify(ok=False), 400
+    ip = (request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+          or request.remote_addr or "")
+    claimed = db.invites.find_one_and_update({"_id": inv["_id"], "dtoken": t, "step": "device"},
+                                             {"$set": {"step": "channel"}, "$unset": {"dtoken": ""}})
+    if not claimed:
+        return jsonify(ok=False), 400
+    db.devices.update_one({"_id": inv["_id"]}, {"$set": {"did": did, "fp": fp, "ip": _h("ip", ip)[:16],
+                                                        "inviter": inv["inviter"], "t": now()}}, upsert=True)
+    tg_http("sendMessage", chat_id=inv["_id"], text="✅ بررسی دستگاه انجام شد. برای ادامه دکمه‌ی زیر رو بزن.",
+            reply_markup={"inline_keyboard": [[{"text": "✅ ادامه", "callback_data": "dev"}]]})
+    return jsonify(ok=True)
+
+
 async def main():
     global user, bot, BOT_USERNAME
     threading.Thread(target=lambda: web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))),
@@ -961,6 +1140,9 @@ async def main():
     bot.add_event_handler(admin_cmd, events.NewMessage(pattern=r"^/admin$", func=adm))
     bot.add_event_handler(on_captcha, events.CallbackQuery(pattern=rb"cap:(.+)"))
     bot.add_event_handler(on_chk, events.CallbackQuery(pattern=rb"chk"))
+    bot.add_event_handler(on_dev, events.CallbackQuery(pattern=rb"dev"))
+    if not PUBLIC_URL:
+        log.warning("PUBLIC_URL تنظیم نشده؛ مرحله‌ی بررسی دستگاه (ضدچندحسابی) غیرفعاله")
     bot.add_event_handler(admin_cb, events.CallbackQuery(pattern=rb"adm:(.*)", func=lambda e: e.sender_id in ADMIN_IDS))
     bot.add_event_handler(on_contact, events.NewMessage(func=lambda e: e.is_private and e.message.contact is not None))
     bot.add_event_handler(admin_text, events.NewMessage(
